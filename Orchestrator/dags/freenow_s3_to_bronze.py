@@ -7,7 +7,6 @@ import logging
 import uuid
 import hashlib
 import boto3
-import os
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
