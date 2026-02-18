@@ -268,30 +268,36 @@ def freenow_s3_to_bronze():
     # -------------------------------------------------
     # 7️⃣ Insert into Bronze (SQLExecuteQueryOperator)
     # -------------------------------------------------
+    insert_payload = with_batch.map(
+        lambda d: {
+            "sql": f"""
+                DELETE FROM bronze.raw_{d['name']}
+                WHERE _file_md5 = '{d['file_md5']}';
+
+                INSERT INTO bronze.raw_{d['name']}
+                ({BRONZE_COLS[d['name']]}, _batch_id, _source_uri, _file_md5, _ingested_at, _row_number)
+                SELECT *,
+                    CAST(%(batch_id)s AS UUID),
+                    %(s3_path)s,
+                    %(file_md5)s,
+                    CURRENT_TIMESTAMP,
+                    ROW_NUMBER() OVER ()
+                FROM bronze.stage_{d['name']}_csv;
+
+                TRUNCATE bronze.stage_{d['name']}_csv;
+            """,
+            "parameters": {
+                "batch_id": d["batch_id"],
+                "s3_path": d["s3_path"],
+                "file_md5": d["file_md5"],
+            },
+        }
+    )
+
     insert_bronze = SQLExecuteQueryOperator.partial(
         task_id="insert_bronze",
         conn_id=POSTGRES_CONN_ID,
-    ).expand(
-        sql=with_batch.map(
-            lambda d: f"""
-            DELETE FROM bronze.raw_{d['name']}
-            WHERE _file_md5 = '{d['file_md5']}';
-
-            INSERT INTO bronze.raw_{d['name']}
-            ({BRONZE_COLS[d['name']]}, _batch_id, _source_uri, _file_md5, _ingested_at, _row_number)
-            SELECT *,
-                   CAST(%(batch_id)s AS UUID),
-                   '{d["s3_path"]}',
-                   '{d["file_md5"]}',
-                   CURRENT_TIMESTAMP,
-                   ROW_NUMBER() OVER ()
-            FROM bronze.stage_{d['name']}_csv;
-
-            DROP TABLE IF EXISTS bronze.stage_{d['name']}_csv;
-            """
-        ),
-        parameters=with_batch,
-    )
+    ).expand_kwargs(insert_payload)
 
     # -------------------------------------------------
     # 8️⃣ Mark SUCCESS (SQLExecuteQueryOperator)
