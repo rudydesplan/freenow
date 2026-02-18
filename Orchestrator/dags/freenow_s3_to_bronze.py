@@ -93,28 +93,52 @@ def freenow_s3_to_bronze():
     @task
     def compute_md5(dataset: dict):
         logger = logging.getLogger(__name__)
-        logger.info("[%s] Starting MD5 computation", dataset["name"])
-        logger.info("[%s] S3 path: %s", dataset["name"], dataset["s3_path"])
 
-        bucket, key = S3Hook().parse_s3_url(dataset["s3_path"])
-        s3_client = boto3.client("s3")
-        response = s3_client.get_object(Bucket=bucket, Key=key)
+        name = dataset["name"]
+        s3_path = dataset["s3_path"]
+
+        logger.info("[%s] Starting MD5 computation", name)
+        logger.info("[%s] S3 path: %s", name, s3_path)
+
+        # Use Airflow S3Hook with proper connection
+        hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+
+        bucket, key = hook.parse_s3_url(s3_path)
+
+        logger.info("[%s] Resolved bucket=%s key=%s", name, bucket, key)
+
+        # Get object (uses Airflow connection credentials)
+        obj = hook.get_key(key=key, bucket_name=bucket)
 
         md5_hash = hashlib.md5()
         total_bytes = 0
+        chunk_size = 8 * 1024 * 1024  # 8 MB
 
-        for chunk in iter(lambda: response["Body"].read(8 * 1024 * 1024), b""):
-            total_bytes += len(chunk)
-            md5_hash.update(chunk)
+        logger.info("[%s] Streaming S3 object for MD5 computation...", name)
 
-        dataset["file_md5"] = md5_hash.hexdigest()
+        # Stream body safely
+        body = obj.get()["Body"]
 
-        logger.info("[%s] Finished MD5 computation", dataset["name"])
-        logger.info("[%s] Total bytes processed: %s", dataset["name"], total_bytes)
-        logger.info("[%s] MD5: %s", dataset["name"], dataset["file_md5"])
+        try:
+            for chunk in iter(lambda: body.read(chunk_size), b""):
+                chunk_len = len(chunk)
+                total_bytes += chunk_len
+                md5_hash.update(chunk)
+
+            dataset["file_md5"] = md5_hash.hexdigest()
+
+        finally:
+            body.close()
+
+        logger.info("[%s] Finished MD5 computation", name)
+        logger.info("[%s] Total bytes processed: %s", name, total_bytes)
+        logger.info("[%s] MD5: %s", name, dataset["file_md5"])
+
         return dataset
 
+
     with_md5 = compute_md5.expand(dataset=enriched)
+
 
     # -------------------------------------------------
     # 4️⃣ Idempotency Check (Postgres)
