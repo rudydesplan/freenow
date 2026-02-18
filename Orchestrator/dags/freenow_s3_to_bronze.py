@@ -1,7 +1,6 @@
-from airflow.sdk import dag, task
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import dag, task , Variable
+from airflow.task.trigger_rule import TriggerRule
 from airflow.exceptions import AirflowSkipException
-from airflow.models import Variable
 from pendulum import datetime
 import logging
 import uuid
