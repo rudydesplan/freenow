@@ -7,21 +7,17 @@ import logging
 import uuid
 import hashlib
 import boto3
+import os
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-
-from astro import sql as aql
-from astro.files import File
-from astro.constants import FileType
-from astro.sql.table import Table, Metadata
-import sqlalchemy as sa
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 
 # ----------------------------
 # Connections
 # ----------------------------
-AWS_CONN_ID = "aws_default"
+AWS_CONN_ID = "aws_default"          # (géré via conn Airflow)
 POSTGRES_CONN_ID = "my_postgres_conn"
 
 
@@ -62,7 +58,7 @@ def freenow_s3_to_bronze():
     def generate_batch_id():
         logger = logging.getLogger(__name__)
         batch_id = str(uuid.uuid4())
-        logger.info(f"Generated new batch_id: {batch_id}")
+        logger.info("Generated new batch_id: %s", batch_id)
         return batch_id
 
     batch_id = generate_batch_id()
@@ -73,19 +69,16 @@ def freenow_s3_to_bronze():
     @task
     def enrich_dataset(dataset: dict):
         logger = logging.getLogger(__name__)
-
         dataset["s3_path"] = Variable.get(dataset["s3_var"])
-
         logger.info(
-            f"[{dataset['name']}] Retrieved S3 path from Variable "
-            f"{dataset['s3_var']} -> {dataset['s3_path']}"
+            "[%s] Retrieved S3 path from Variable %s -> %s",
+            dataset["name"],
+            dataset["s3_var"],
+            dataset["s3_path"],
         )
-
         return dataset
 
     enriched = enrich_dataset.expand(dataset=DATASETS)
-
-
 
     # -------------------------------------------------
     # 3️⃣ Compute true MD5
@@ -93,13 +86,11 @@ def freenow_s3_to_bronze():
     @task
     def compute_md5(dataset: dict):
         logger = logging.getLogger(__name__)
-
-        logger.info(f"[{dataset['name']}] Starting MD5 computation")
-        logger.info(f"[{dataset['name']}] S3 path: {dataset['s3_path']}")
+        logger.info("[%s] Starting MD5 computation", dataset["name"])
+        logger.info("[%s] S3 path: %s", dataset["name"], dataset["s3_path"])
 
         bucket, key = S3Hook().parse_s3_str(dataset["s3_path"])
         s3_client = boto3.client("s3")
-
         response = s3_client.get_object(Bucket=bucket, Key=key)
 
         md5_hash = hashlib.md5()
@@ -111,14 +102,12 @@ def freenow_s3_to_bronze():
 
         dataset["file_md5"] = md5_hash.hexdigest()
 
-        logger.info(f"[{dataset['name']}] Finished MD5 computation")
-        logger.info(f"[{dataset['name']}] Total bytes processed: {total_bytes}")
-        logger.info(f"[{dataset['name']}] MD5: {dataset['file_md5']}")
-
+        logger.info("[%s] Finished MD5 computation", dataset["name"])
+        logger.info("[%s] Total bytes processed: %s", dataset["name"], total_bytes)
+        logger.info("[%s] MD5: %s", dataset["name"], dataset["file_md5"])
         return dataset
 
     with_md5 = compute_md5.expand(dataset=enriched)
-
 
     # -------------------------------------------------
     # 4️⃣ Idempotency Check (Postgres)
@@ -126,12 +115,9 @@ def freenow_s3_to_bronze():
     @task
     def check_idempotency(dataset: dict):
         logger = logging.getLogger(__name__)
-
-        logger.info(f"[{dataset['name']}] Checking idempotency")
-        logger.info(f"[{dataset['name']}] MD5: {dataset['file_md5']}")
+        logger.info("[%s] Checking idempotency (MD5=%s)", dataset["name"], dataset["file_md5"])
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-
         sql = """
             SELECT 1
             FROM bronze.ingestion_files
@@ -139,30 +125,22 @@ def freenow_s3_to_bronze():
               AND file_md5 = %s
               AND load_status = 'SUCCESS';
         """
-
-        result = hook.get_first(
-            sql,
-            parameters=(dataset["name"], dataset["file_md5"]),
-        )
+        result = hook.get_first(sql, parameters=(dataset["name"], dataset["file_md5"]))
 
         if result:
-            logger.warning(
-                f"[{dataset['name']}] Already ingested with same MD5. Skipping."
-            )
-            raise AirflowSkipException(
-                f"{dataset['name']} already ingested with same MD5"
-            )
+            logger.warning("[%s] Already ingested with same MD5. Skipping.", dataset["name"])
+            raise AirflowSkipException(f"{dataset['name']} already ingested with same MD5")
 
-        logger.info(f"[{dataset['name']}] No previous successful ingestion found.")
+        logger.info("[%s] No previous successful ingestion found.", dataset["name"])
         return dataset
 
     filtered = check_idempotency.expand(dataset=with_md5)
 
-
     # -------------------------------------------------
-    # 5️⃣ Register RUNNING
+    # 5️⃣ Register RUNNING  (SQLExecuteQueryOperator)
     # -------------------------------------------------
-    start_audit = aql.run_raw_sql.partial(
+    start_audit = SQLExecuteQueryOperator.partial(
+        task_id="start_audit",
         conn_id=POSTGRES_CONN_ID,
     ).expand(
         sql=[
@@ -185,42 +163,70 @@ def freenow_s3_to_bronze():
                 CURRENT_TIMESTAMP,
                 'RUNNING'
             );
-            """,
+            """
         ],
         parameters=filtered,
     )
 
     # -------------------------------------------------
-    # 6️⃣ Load to Postgres staging
+    # 6️⃣ Load to Postgres staging (S3 -> local -> PostgresHook.copy_expert)
     # -------------------------------------------------
-    def stage_table(dataset):
-        return Table(
-            name=f"stage_{dataset['name']}_csv",
-            conn_id=POSTGRES_CONN_ID,
-            metadata=Metadata(schema="bronze"),
-            columns=[sa.Column(c, sa.String) for c in TABLE_SPECS[dataset["name"]]],
-        )
+    @task
+    def load_stage(dataset: dict):
+        """
+        - Télécharge le CSV depuis S3 vers /tmp
+        - (Re)crée bronze.stage_<dataset>_csv en TEXT
+        - COPY ... FROM STDIN via PostgresHook.copy_expert
+        """
+        logger = logging.getLogger(__name__)
+        name = dataset["name"]
 
-    load_stage = aql.load_file.partial(
-        conn_id=POSTGRES_CONN_ID,
-        if_exists="replace",
-        assume_schema_exists=True,
-        use_native_support=False,
-    ).expand(
-        input_file=filtered.map(
-            lambda d: File(
-                path=d["s3_path"],
-                conn_id=AWS_CONN_ID,
-                filetype=FileType.CSV,
-            )
-        ),
-        output_table=filtered.map(stage_table),
-    )
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+        pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+        bucket, key = s3_hook.parse_s3_str(dataset["s3_path"])
+        local_file = f"/tmp/{name}.csv"
+
+        logger.info("[%s] Downloading %s to %s", name, dataset["s3_path"], local_file)
+        s3_hook.download_file(key=key, bucket_name=bucket, local_path=local_file)
+
+        # DDL stage table
+        cols = TABLE_SPECS[name]
+        columns_sql = ", ".join(f'"{c}" TEXT' for c in cols)
+
+        ddl = f"""
+        DROP TABLE IF EXISTS bronze.stage_{name}_csv;
+        CREATE TABLE bronze.stage_{name}_csv (
+            {columns_sql}
+        );
+        """
+        logger.info("[%s] Creating stage table bronze.stage_%s_csv", name, name)
+        pg_hook.run(ddl)
+
+        # COPY
+        copy_sql = f"""
+            COPY bronze.stage_{name}_csv
+            FROM STDIN
+            WITH (FORMAT csv, HEADER true)
+        """
+        logger.info("[%s] COPY into bronze.stage_%s_csv", name, name)
+        pg_hook.copy_expert(sql=copy_sql, filename=local_file)
+
+        # Cleanup
+        try:
+            os.remove(local_file)
+        except OSError:
+            logger.warning("[%s] Could not delete temp file: %s", name, local_file)
+
+        return dataset
+
+    load_stage_task = load_stage.expand(dataset=filtered)
 
     # -------------------------------------------------
-    # 7️⃣ Insert into Bronze
+    # 7️⃣ Insert into Bronze (SQLExecuteQueryOperator)
     # -------------------------------------------------
-    insert_bronze = aql.run_raw_sql.partial(
+    insert_bronze = SQLExecuteQueryOperator.partial(
+        task_id="insert_bronze",
         conn_id=POSTGRES_CONN_ID,
     ).expand(
         sql=filtered.map(
@@ -244,9 +250,10 @@ def freenow_s3_to_bronze():
     )
 
     # -------------------------------------------------
-    # 8️⃣ Mark SUCCESS
+    # 8️⃣ Mark SUCCESS (SQLExecuteQueryOperator)
     # -------------------------------------------------
-    mark_success = aql.run_raw_sql.partial(
+    mark_success = SQLExecuteQueryOperator.partial(
+        task_id="mark_success",
         conn_id=POSTGRES_CONN_ID,
         trigger_rule=TriggerRule.ALL_SUCCESS,
     ).expand(
@@ -267,9 +274,10 @@ def freenow_s3_to_bronze():
     )
 
     # -------------------------------------------------
-    # 9️⃣ Mark FAILED
+    # 9️⃣ Mark FAILED (SQLExecuteQueryOperator)
     # -------------------------------------------------
-    mark_failed = aql.run_raw_sql.partial(
+    mark_failed = SQLExecuteQueryOperator.partial(
+        task_id="mark_failed",
         conn_id=POSTGRES_CONN_ID,
         trigger_rule=TriggerRule.ONE_FAILED,
     ).expand(
@@ -288,15 +296,14 @@ def freenow_s3_to_bronze():
     # -------------------------------------------------
     # 🔗 Proper Dependencies (Mapped-aware)
     # -------------------------------------------------
-
     batch_id >> enriched >> with_md5 >> filtered
 
     filtered >> start_audit
-    start_audit >> load_stage
-    load_stage >> insert_bronze
+    start_audit >> load_stage_task
+    load_stage_task >> insert_bronze
 
     insert_bronze >> mark_success
-    [start_audit, load_stage, insert_bronze] >> mark_failed
+    [start_audit, load_stage_task, insert_bronze] >> mark_failed
 
 
 dag = freenow_s3_to_bronze()

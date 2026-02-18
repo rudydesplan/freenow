@@ -2,7 +2,6 @@
 apache-airflow-providers-amazon
 apache-airflow-providers-postgres
 apache-airflow-providers-common-sql
-astro-sdk-python==1.8.1
 boto3
 sqlalchemy
 psycopg2-binary
