@@ -96,7 +96,7 @@ def freenow_s3_to_bronze():
         logger.info("[%s] Starting MD5 computation", dataset["name"])
         logger.info("[%s] S3 path: %s", dataset["name"], dataset["s3_path"])
 
-        bucket, key = S3Hook().parse_s3_str(dataset["s3_path"])
+        bucket, key = S3Hook().parse_s3_url(dataset["s3_path"])
         s3_client = boto3.client("s3")
         response = s3_client.get_object(Bucket=bucket, Key=key)
 
