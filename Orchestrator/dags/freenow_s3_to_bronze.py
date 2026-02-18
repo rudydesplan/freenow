@@ -214,7 +214,7 @@ def freenow_s3_to_bronze():
         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
         pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
-        bucket, key = s3_hook.parse_s3_str(dataset["s3_path"])
+        bucket, key = s3_hook.parse_s3_url(dataset["s3_path"])
         local_file = f"/tmp/{name}.csv"
 
         logger.info("[%s] Downloading %s to %s", name, dataset["s3_path"], local_file)
