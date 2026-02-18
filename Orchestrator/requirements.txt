@@ -2,7 +2,6 @@
 apache-airflow-providers-amazon
 apache-airflow-providers-postgres
 apache-airflow-providers-common-sql
-boto3
 sqlalchemy
 psycopg2-binary
 asyncpg 
