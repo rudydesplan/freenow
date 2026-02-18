@@ -4,4 +4,5 @@ apache-airflow-providers-postgres
 apache-airflow-providers-common-sql
 sqlalchemy
 psycopg2-binary
-asyncpg 
+asyncpg
+flask-appbuilder
