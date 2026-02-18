@@ -99,14 +99,11 @@ def freenow_s3_to_bronze():
         logger.info("[%s] Starting MD5 computation", name)
         logger.info("[%s] S3 path: %s", name, s3_path)
 
-        # Use Airflow S3Hook with proper connection
         hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-
         bucket, key = hook.parse_s3_url(s3_path)
 
         logger.info("[%s] Resolved bucket=%s key=%s", name, bucket, key)
 
-        # Get object (uses Airflow connection credentials)
         obj = hook.get_key(key=key, bucket_name=bucket)
 
         md5_hash = hashlib.md5()
@@ -115,7 +112,6 @@ def freenow_s3_to_bronze():
 
         logger.info("[%s] Streaming S3 object for MD5 computation...", name)
 
-        # Stream body safely
         body = obj.get()["Body"]
 
         try:
@@ -135,9 +131,7 @@ def freenow_s3_to_bronze():
 
         return dataset
 
-
     with_md5 = compute_md5.expand(dataset=enriched)
-
 
     # -------------------------------------------------
     # 4️⃣ Idempotency Check (Postgres)
@@ -167,6 +161,16 @@ def freenow_s3_to_bronze():
     filtered = check_idempotency.expand(dataset=with_md5)
 
     # -------------------------------------------------
+    # ✅ Attach batch_id to each mapped dataset (NEW)
+    # -------------------------------------------------
+    @task
+    def attach_batch_id(dataset: dict, batch_id: str):
+        dataset["batch_id"] = batch_id
+        return dataset
+
+    with_batch = attach_batch_id.partial(batch_id=batch_id).expand(dataset=filtered)
+
+    # -------------------------------------------------
     # 5️⃣ Register RUNNING  (SQLExecuteQueryOperator)
     # -------------------------------------------------
     start_audit = SQLExecuteQueryOperator.partial(
@@ -185,7 +189,7 @@ def freenow_s3_to_bronze():
                 load_status
             )
             VALUES (
-                CAST('{{ ti.xcom_pull(task_ids="generate_batch_id") }}' AS UUID),
+                CAST(%(batch_id)s AS UUID),
                 %(name)s,
                 %(s3_path)s,
                 'csv',
@@ -195,7 +199,7 @@ def freenow_s3_to_bronze():
             );
             """
         ],
-        parameters=filtered,
+        parameters=with_batch,
     )
 
     # -------------------------------------------------
@@ -203,6 +207,11 @@ def freenow_s3_to_bronze():
     # -------------------------------------------------
     @task
     def load_stage(dataset: dict):
+        """
+        - Télécharge le CSV depuis S3 vers /tmp/<dataset>/
+        - (Re)crée bronze.stage_<dataset>_csv en TEXT
+        - COPY ... FROM STDIN via PostgresHook.copy_expert
+        """
         logger = logging.getLogger(__name__)
         name = dataset["name"]
         s3_path = dataset["s3_path"]
@@ -210,16 +219,13 @@ def freenow_s3_to_bronze():
         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
         pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
-        # Resolve bucket and key
         bucket, key = s3_hook.parse_s3_url(s3_path)
 
-        # Dedicated temp directory per dataset (safe for dynamic mapping)
         local_dir = f"/tmp/{name}"
         os.makedirs(local_dir, exist_ok=True)
 
         logger.info("[%s] Downloading %s to directory %s", name, s3_path, local_dir)
 
-        # Download file (preserves original S3 filename)
         local_file = s3_hook.download_file(
             key=key,
             bucket_name=bucket,
@@ -230,9 +236,6 @@ def freenow_s3_to_bronze():
 
         logger.info("[%s] File downloaded successfully to %s", name, local_file)
 
-        # -------------------------------------------------
-        # Create stage table
-        # -------------------------------------------------
         cols = TABLE_SPECS[name]
         columns_sql = ", ".join(f'"{c}" TEXT' for c in cols)
 
@@ -242,42 +245,25 @@ def freenow_s3_to_bronze():
             {columns_sql}
         );
         """
-
         logger.info("[%s] Creating stage table bronze.stage_%s_csv", name, name)
         pg_hook.run(ddl)
 
-        # -------------------------------------------------
-        # COPY into Postgres
-        # -------------------------------------------------
         copy_sql = f"""
             COPY bronze.stage_{name}_csv
             FROM STDIN
             WITH (FORMAT csv, HEADER true)
         """
-
         logger.info("[%s] COPY into bronze.stage_%s_csv from %s", name, name, local_file)
+        pg_hook.copy_expert(sql=copy_sql, filename=local_file)
 
-        pg_hook.copy_expert(
-            sql=copy_sql,
-            filename=local_file,
-        )
-
-        logger.info("[%s] COPY completed successfully", name)
-
-        # -------------------------------------------------
-        # Cleanup
-        # -------------------------------------------------
         try:
             os.remove(local_file)
-            logger.info("[%s] Temp file removed: %s", name, local_file)
-        except OSError as e:
-            logger.warning("[%s] Could not delete temp file %s: %s", name, local_file, str(e))
+        except OSError:
+            logger.warning("[%s] Could not delete temp file: %s", name, local_file)
 
         return dataset
 
-
-    load_stage_task = load_stage.expand(dataset=filtered)
-
+    load_stage_task = load_stage.expand(dataset=with_batch)
 
     # -------------------------------------------------
     # 7️⃣ Insert into Bronze (SQLExecuteQueryOperator)
@@ -286,7 +272,7 @@ def freenow_s3_to_bronze():
         task_id="insert_bronze",
         conn_id=POSTGRES_CONN_ID,
     ).expand(
-        sql=filtered.map(
+        sql=with_batch.map(
             lambda d: f"""
             DELETE FROM bronze.raw_{d['name']}
             WHERE _file_md5 = '{d['file_md5']}';
@@ -294,7 +280,7 @@ def freenow_s3_to_bronze():
             INSERT INTO bronze.raw_{d['name']}
             ({BRONZE_COLS[d['name']]}, _batch_id, _source_uri, _file_md5, _ingested_at, _row_number)
             SELECT *,
-                   CAST('{{{{ ti.xcom_pull(task_ids="generate_batch_id") }}}}' AS UUID),
+                   CAST(%(batch_id)s AS UUID),
                    '{d["s3_path"]}',
                    '{d["file_md5"]}',
                    CURRENT_TIMESTAMP,
@@ -303,7 +289,8 @@ def freenow_s3_to_bronze():
 
             DROP TABLE IF EXISTS bronze.stage_{d['name']}_csv;
             """
-        )
+        ),
+        parameters=with_batch,
     )
 
     # -------------------------------------------------
@@ -314,7 +301,7 @@ def freenow_s3_to_bronze():
         conn_id=POSTGRES_CONN_ID,
         trigger_rule=TriggerRule.ALL_SUCCESS,
     ).expand(
-        sql=filtered.map(
+        sql=with_batch.map(
             lambda d: f"""
             UPDATE bronze.ingestion_files
             SET load_status = 'SUCCESS',
@@ -325,9 +312,10 @@ def freenow_s3_to_bronze():
                 ),
                 load_finished_at = CURRENT_TIMESTAMP
             WHERE dataset_name = '{d['name']}'
-              AND batch_id = CAST('{{{{ ti.xcom_pull(task_ids="generate_batch_id") }}}}' AS UUID);
+              AND batch_id = CAST(%(batch_id)s AS UUID);
             """
-        )
+        ),
+        parameters=with_batch,
     )
 
     # -------------------------------------------------
@@ -338,24 +326,25 @@ def freenow_s3_to_bronze():
         conn_id=POSTGRES_CONN_ID,
         trigger_rule=TriggerRule.ONE_FAILED,
     ).expand(
-        sql=filtered.map(
+        sql=with_batch.map(
             lambda d: f"""
             UPDATE bronze.ingestion_files
             SET load_status = 'FAILED',
                 error_message = 'Bronze ingestion failed',
                 load_finished_at = CURRENT_TIMESTAMP
             WHERE dataset_name = '{d['name']}'
-              AND batch_id = CAST('{{{{ ti.xcom_pull(task_ids="generate_batch_id") }}}}' AS UUID);
+              AND batch_id = CAST(%(batch_id)s AS UUID);
             """
-        )
+        ),
+        parameters=with_batch,
     )
 
     # -------------------------------------------------
     # 🔗 Proper Dependencies (Mapped-aware)
     # -------------------------------------------------
-    batch_id >> enriched >> with_md5 >> filtered
+    batch_id >> enriched >> with_md5 >> filtered >> with_batch
 
-    filtered >> start_audit
+    with_batch >> start_audit
     start_audit >> load_stage_task
     load_stage_task >> insert_bronze
 
