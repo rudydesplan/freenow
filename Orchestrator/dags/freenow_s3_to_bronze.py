@@ -1,5 +1,6 @@
-from airflow.sdk import dag, task , Variable
-from airflow.task.trigger_rule import TriggerRule
+import os
+from airflow.sdk import dag, task
+from airflow.utils.trigger_rule import TriggerRule
 from airflow.exceptions import AirflowSkipException
 from pendulum import datetime
 import logging
@@ -68,13 +69,21 @@ def freenow_s3_to_bronze():
     @task
     def enrich_dataset(dataset: dict):
         logger = logging.getLogger(__name__)
-        dataset["s3_path"] = Variable.get(dataset["s3_var"])
+
+        key = dataset["s3_var"]
+
+        if key not in os.environ:
+            raise ValueError(f"Environment variable {key} not found")
+
+        dataset["s3_path"] = os.environ[key]
+
         logger.info(
-            "[%s] Retrieved S3 path from Variable %s -> %s",
+            "[%s] S3 path resolved from ENV %s -> %s",
             dataset["name"],
-            dataset["s3_var"],
+            key,
             dataset["s3_path"],
         )
+
         return dataset
 
     enriched = enrich_dataset.expand(dataset=DATASETS)
