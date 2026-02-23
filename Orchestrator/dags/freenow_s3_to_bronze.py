@@ -23,21 +23,15 @@ POSTGRES_CONN_ID = "my_postgres_conn"
 # Dataset Config
 # ----------------------------
 DATASETS = [
-    {"name": "drivers",  "s3_var": "S3_DRIVERS_URI"},
-    {"name": "offers",   "s3_var": "S3_OFFERS_URI"},
-    {"name": "bookings", "s3_var": "S3_BOOKINGS_URI"},
+    {"name": "drivers",  "s3_var": "S3_DRIVERS_URI"}
 ]
 
 TABLE_SPECS = {
-  "drivers":  ["id", "country", "rating", "rating_count", "date_registration", "receive_marketing"],
-  "offers":   ["id", "datecreated", "bookingid", "driverid", "routedistance", "state", "driverread"],
-  "bookings": ["id", "request_date", "status", "id_driver", "estimated_route_fare"],
+  "drivers":  ["id", "country", "rating", "rating_count", "date_registration", "receive_marketing"]
 }
 
 BRONZE_COLS = {
-    "drivers": "id, country, rating, rating_count, date_registration, receive_marketing",
-    "offers": "id, datecreated, bookingid, driverid, routedistance, state, driverread",
-    "bookings": "id, request_date, status, id_driver, estimated_route_fare",
+    "drivers": "id, country, rating, rating_count, date_registration, receive_marketing"
 }
 
 
