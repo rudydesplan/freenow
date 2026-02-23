@@ -27,11 +27,11 @@ DATASETS = [
 ]
 
 TABLE_SPECS = {
-  "drivers":  ["id", "country", "rating", "rating_count", "date_registration", "receive_marketing"]
+  "drivers":  ["id", "country", "driver_rating", "rating_count", "date_registration", "receive_marketing"]
 }
 
 BRONZE_COLS = {
-    "drivers": "id, country, rating, rating_count, date_registration, receive_marketing"
+    "drivers": "id, country, driver_rating, rating_count, date_registration, receive_marketing"
 }
 
 
