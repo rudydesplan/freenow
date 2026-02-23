@@ -29,13 +29,13 @@ DATASETS = [
 ]
 
 TABLE_SPECS = {
-    "drivers":  ["id", "Date_registration", "Driver_rating", "Rating_count", "Receive_marketing", "Country"],
-    "offers":   ["id", "Datecreated", "bookingid", "driverid", "routedistance", "state", "driverread"],
-    "bookings": ["Id", "request_date", "status", "Id_driver", "Estimated_route_fare"],
+  "drivers":  ["id", "country", "rating", "rating_count", "date_registration", "receive_marketing"],
+  "offers":   ["id", "datecreated", "bookingid", "driverid", "routedistance", "state", "driverread"],
+  "bookings": ["id", "request_date", "status", "id_driver", "estimated_route_fare"],
 }
 
 BRONZE_COLS = {
-    "drivers": "id, date_registration, driver_rating, rating_count, receive_marketing, country",
+    "drivers": "id, country, rating, rating_count, date_registration, receive_marketing",
     "offers": "id, datecreated, bookingid, driverid, routedistance, state, driverread",
     "bookings": "id, request_date, status, id_driver, estimated_route_fare",
 }
